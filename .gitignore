@@ -1,0 +1,4 @@
+venv
+.env
+get_session.py
+telegram_data.db
