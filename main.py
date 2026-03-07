@@ -1,15 +1,16 @@
 import os
 import asyncio
-import sqlite3
 import logging
 from contextlib import asynccontextmanager
-from typing import Optional, List
+from typing import Optional
 
-from fastapi import FastAPI, Query
+from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
+import psycopg2
+import psycopg2.extras
 
 # Setup Logging
 logging.basicConfig(level=logging.INFO)
@@ -21,7 +22,12 @@ API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 SESSION_STRING = os.getenv("SESSION_STRING")
 TARGET_CHANNEL = os.getenv("TARGET_CHANNEL")
-DB_NAME = "telegram_data.db"
+
+DB_HOST = os.getenv("DB_HOST", "postgres")
+DB_PORT = int(os.getenv("DB_PORT", 5432))
+DB_NAME = os.getenv("DB_NAME", "telegram_db")
+DB_USER = os.getenv("DB_USER", "postgres")
+DB_PASSWORD = os.getenv("DB_PASSWORD", "postgres")
 
 def get_peer():
     if TARGET_CHANNEL.lstrip('-').isdigit():
@@ -30,26 +36,33 @@ def get_peer():
 
 # Database Manager
 def get_db_connection():
-    """Creates a database connection with UTF-8 enforcement"""
-    conn = sqlite3.connect(DB_NAME)
-    conn.row_factory = sqlite3.Row
-    # Force the database to return Python Unicode strings, not bytes
-    conn.text_factory = lambda x: str(x, 'utf-8', 'ignore') if isinstance(x, bytes) else x
-    return conn
+    return psycopg2.connect(
+        host=DB_HOST,
+        port=DB_PORT,
+        dbname=DB_NAME,
+        user=DB_USER,
+        password=DB_PASSWORD
+    )
 
 def init_db():
     conn = get_db_connection()
     c = conn.cursor()
-    c.execute('''
+    c.execute("""
         CREATE TABLE IF NOT EXISTS messages (
-            id INTEGER PRIMARY KEY,
-            message_id INTEGER UNIQUE,
-            date TEXT,
-            sender_id INTEGER,
+            id SERIAL PRIMARY KEY,
+            message_id BIGINT UNIQUE,
+            date TIMESTAMP,
+            sender_id BIGINT,
             text TEXT,
             media_type TEXT
         )
-    ''')
+    """)
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_messages_date ON messages(date DESC)
+    """)
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_messages_message_id ON messages(message_id)
+    """)
     conn.commit()
     conn.close()
 
@@ -57,22 +70,27 @@ def save_message(msg):
     try:
         conn = get_db_connection()
         c = conn.cursor()
-        
+
         media_type = None
         if msg.media:
             media_type = type(msg.media).__name__
 
         text_content = msg.message if msg.message else ""
 
-        c.execute('''
-            INSERT OR REPLACE INTO messages 
-            (message_id, date, sender_id, text, media_type)
-            VALUES (?, ?, ?, ?, ?)
-        ''', (
-            msg.id, 
-            msg.date.strftime('%Y-%m-%d %H:%M:%S'),
+        c.execute("""
+            INSERT INTO messages (message_id, date, sender_id, text, media_type)
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (message_id)
+            DO UPDATE SET
+                date = EXCLUDED.date,
+                sender_id = EXCLUDED.sender_id,
+                text = EXCLUDED.text,
+                media_type = EXCLUDED.media_type
+        """, (
+            msg.id,
+            msg.date.replace(tzinfo=None) if msg.date else None,
             msg.sender_id,
-            text_content, 
+            text_content,
             media_type
         ))
         conn.commit()
@@ -84,7 +102,6 @@ def save_message(msg):
 client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 
 async def sync_history():
-    """Downloads past messages from the channel"""
     logger.info(f"Syncing history for {TARGET_CHANNEL}...")
     try:
         channel = await client.get_entity(get_peer())
@@ -96,11 +113,9 @@ async def sync_history():
 
 @client.on(events.NewMessage(chats=get_peer()))
 async def handler(event):
-    """Listens for new messages in real-time"""
     logger.info(f"New message received: {event.message.id}")
     save_message(event.message)
 
-# FastAPI 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
@@ -114,24 +129,29 @@ app = FastAPI(lifespan=lifespan)
 @app.get("/messages")
 def get_messages(limit: int = 100, offset: int = 0, search: Optional[str] = None):
     conn = get_db_connection()
-    c = conn.cursor()
-    
+    c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
     query = "SELECT * FROM messages"
     params = []
-    
+
     if search:
-        query += " WHERE text LIKE ?"
+        query += " WHERE text ILIKE %s"
         params.append(f"%{search}%")
-        
-    query += " ORDER BY date DESC LIMIT ? OFFSET ?"
+
+    query += " ORDER BY date DESC LIMIT %s OFFSET %s"
     params.extend([limit, offset])
-    
+
     c.execute(query, params)
     rows = c.fetchall()
     conn.close()
-    
-    data = [dict(row) for row in rows]
-    
+
+    data = []
+    for row in rows:
+        item = dict(row)
+        if item.get("date") is not None:
+            item["date"] = item["date"].isoformat()
+        data.append(item)
+
     return JSONResponse(content=data, media_type="application/json; charset=utf-8")
 
 if __name__ == "__main__":

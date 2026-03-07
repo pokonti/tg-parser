@@ -2,3 +2,4 @@ fastapi
 uvicorn
 telethon
 python-dotenv
+psycopg2-binary
