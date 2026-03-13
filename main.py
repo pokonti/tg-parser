@@ -11,6 +11,7 @@ from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 import psycopg2
 import psycopg2.extras
+import re
 
 # Setup Logging
 logging.basicConfig(level=logging.INFO)
@@ -29,6 +30,16 @@ DB_NAME = os.getenv("DB_NAME", "telegram_db")
 DB_USER = os.getenv("DB_USER", "postgres")
 DB_PASSWORD = os.getenv("DB_PASSWORD", "postgres")
 
+def detect_language(text: str):
+    text = text.lower()
+
+    if re.search(r"[әіңғүұқөһ]", text):
+        return "kz"
+
+    if re.search(r"[a-z]", text) and not re.search(r"[а-я]", text):
+        return "en"
+
+    return "ru"
 def get_peer():
     if TARGET_CHANNEL.lstrip('-').isdigit():
         return int(TARGET_CHANNEL)
@@ -126,6 +137,17 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
+from fastapi.middleware.cors import CORSMiddleware
+
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
 @app.get("/messages")
 def get_messages(limit: int = 100, offset: int = 0, search: Optional[str] = None):
     conn = get_db_connection()
@@ -153,6 +175,63 @@ def get_messages(limit: int = 100, offset: int = 0, search: Optional[str] = None
         data.append(item)
 
     return JSONResponse(content=data, media_type="application/json; charset=utf-8")
+@app.get("/news")
+def get_news(limit: int = 10):
+    conn = get_db_connection()
+    c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+    c.execute("""
+        SELECT * FROM messages
+        WHERE text IS NOT NULL AND text <> ''
+        ORDER BY date DESC
+        LIMIT %s
+    """, (limit * 9,))
+
+    rows = c.fetchall()
+    conn.close()
+
+    # Группируем сообщения по "окну времени" — 30 секунд
+    # Сообщения на 3 языках отправляются почти одновременно
+    from datetime import datetime, timedelta
+
+    groups = []  # список: {"date": ..., "ru": ..., "en": ..., "kz": ...}
+
+    for row in rows:
+        text = row["text"]
+        if not text:
+            continue
+
+        lang = detect_language(text)
+        msg_date = row["date"]  # уже datetime объект из psycopg2
+
+        # Ищем существующую группу в пределах 30 секунд
+        matched_group = None
+        for group in groups:
+            if abs((group["_date"] - msg_date).total_seconds()) <= 30:
+                matched_group = group
+                break
+
+        if matched_group is None:
+            matched_group = {
+                "_date": msg_date,
+                "date": msg_date.isoformat() if msg_date else None,
+                "ru": None,
+                "en": None,
+                "kz": None
+            }
+            groups.append(matched_group)
+
+        # Только если язык ещё не заполнен
+        if matched_group[lang] is None:
+            matched_group[lang] = text
+
+    # Убираем служебное поле и берём только полные/частичные группы
+    result = []
+    for g in groups:
+        del g["_date"]
+        result.append(g)
+
+    return JSONResponse(content=result[:limit], media_type="application/json; charset=utf-8")
 
 if __name__ == "__main__":
     import uvicorn
