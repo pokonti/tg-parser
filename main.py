@@ -3,6 +3,7 @@ import asyncio
 import logging
 from contextlib import asynccontextmanager
 from typing import Optional
+from datetime import datetime
 
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
@@ -11,7 +12,9 @@ from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 import psycopg2
 import psycopg2.extras
-import re
+
+from gemini_enricher import GeminiEnricher
+from google.api_core import exceptions
 
 # Setup Logging
 logging.basicConfig(level=logging.INFO)
@@ -19,6 +22,7 @@ logger = logging.getLogger("TelegramService")
 
 # Load Config
 load_dotenv()
+
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 SESSION_STRING = os.getenv("SESSION_STRING")
@@ -30,20 +34,15 @@ DB_NAME = os.getenv("DB_NAME", "telegram_db")
 DB_USER = os.getenv("DB_USER", "postgres")
 DB_PASSWORD = os.getenv("DB_PASSWORD", "postgres")
 
-def detect_language(text: str):
-    text = text.lower()
+# Gemini enricher
+enricher = GeminiEnricher()
 
-    if re.search(r"[әіңғүұқөһ]", text):
-        return "kz"
 
-    if re.search(r"[a-z]", text) and not re.search(r"[а-я]", text):
-        return "en"
-
-    return "ru"
 def get_peer():
-    if TARGET_CHANNEL.lstrip('-').isdigit():
+    if TARGET_CHANNEL.lstrip("-").isdigit():
         return int(TARGET_CHANNEL)
     return TARGET_CHANNEL
+
 
 # Database Manager
 def get_db_connection():
@@ -52,12 +51,15 @@ def get_db_connection():
         port=DB_PORT,
         dbname=DB_NAME,
         user=DB_USER,
-        password=DB_PASSWORD
+        password=DB_PASSWORD,
     )
+
 
 def init_db():
     conn = get_db_connection()
     c = conn.cursor()
+
+    # Base table
     c.execute("""
         CREATE TABLE IF NOT EXISTS messages (
             id SERIAL PRIMARY KEY,
@@ -68,64 +70,204 @@ def init_db():
             media_type TEXT
         )
     """)
+
+    # Add new columns safely for existing DB
+    c.execute("""
+        ALTER TABLE messages
+        ADD COLUMN IF NOT EXISTS language TEXT
+    """)
+    c.execute("""
+        ALTER TABLE messages
+        ADD COLUMN IF NOT EXISTS category TEXT
+    """)
+    c.execute("""
+        ALTER TABLE messages
+        ADD COLUMN IF NOT EXISTS summary TEXT
+    """)
+    c.execute("""
+        ALTER TABLE messages
+        ADD COLUMN IF NOT EXISTS tags JSONB
+    """)
+    c.execute("""
+        ALTER TABLE messages
+        ADD COLUMN IF NOT EXISTS event_date TIMESTAMP NULL
+    """)
+    c.execute("""
+        ALTER TABLE messages
+        ADD COLUMN IF NOT EXISTS location TEXT
+    """)
+    c.execute("""
+        ALTER TABLE messages
+        ADD COLUMN IF NOT EXISTS confidence DOUBLE PRECISION
+    """)
+
+    # Indexes
     c.execute("""
         CREATE INDEX IF NOT EXISTS idx_messages_date ON messages(date DESC)
     """)
     c.execute("""
         CREATE INDEX IF NOT EXISTS idx_messages_message_id ON messages(message_id)
     """)
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_messages_category ON messages(category)
+    """)
+
+    conn.commit()
+    conn.close()
+    conn = get_db_connection()
+    c = conn.cursor()
+
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS messages (
+            id SERIAL PRIMARY KEY,
+            message_id BIGINT UNIQUE,
+            date TIMESTAMP,
+            sender_id BIGINT,
+            text TEXT,
+            media_type TEXT,
+
+            language TEXT,
+            category TEXT,
+            summary TEXT,
+            tags JSONB,
+            event_date TIMESTAMP NULL,
+            location TEXT,
+            confidence DOUBLE PRECISION
+        )
+        """
+    )
+
+    c.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_messages_date ON messages(date DESC)
+        """
+    )
+    c.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_messages_message_id ON messages(message_id)
+        """
+    )
+    c.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_messages_category ON messages(category)
+        """
+    )
+
     conn.commit()
     conn.close()
 
-def save_message(msg):
+
+async def save_message(msg):
     try:
+        text_content = msg.message if msg.message else ""
+        if not text_content.strip():
+            return
+
+        # 1. Check if already exists to save Gemini quota
         conn = get_db_connection()
         c = conn.cursor()
+        c.execute("SELECT category FROM messages WHERE message_id = %s", (msg.id,))
+        existing = c.fetchone()
+        
+        if existing and existing[0] is not None:
+            conn.close()
+            return
 
-        media_type = None
-        if msg.media:
-            media_type = type(msg.media).__name__
+        try:
+            # Increase base sleep to 6 seconds to stay under 15 RPM safely
+            await asyncio.sleep(6) 
+            enriched = await enricher.enrich(text_content)
+        except exceptions.ResourceExhausted:
+            logger.error("Quota hit! Sleeping for 60 seconds before retrying...")
+            await asyncio.sleep(60) # Heavy sleep on quota hit
+            return
+        
+        # 2. Throttling for Gemini
+        await asyncio.sleep(4) 
 
-        text_content = msg.message if msg.message else ""
+        enriched = await enricher.enrich(text_content)
+        
+        # Parse event date
+        event_date = None
+        if enriched and enriched.event_date:
+            try:
+                event_date = datetime.fromisoformat(
+                    enriched.event_date.replace("Z", "+00:00")
+                ).replace(tzinfo=None)
+            except Exception:
+                pass
 
-        c.execute("""
-            INSERT INTO messages (message_id, date, sender_id, text, media_type)
-            VALUES (%s, %s, %s, %s, %s)
+        # 3. FULL SQL QUERY (Replacing the "..." placeholders)
+        c.execute(
+            """
+            INSERT INTO messages (
+                message_id, date, sender_id, text, media_type,
+                language, category, summary, tags, event_date, location, confidence
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (message_id)
             DO UPDATE SET
                 date = EXCLUDED.date,
                 sender_id = EXCLUDED.sender_id,
                 text = EXCLUDED.text,
-                media_type = EXCLUDED.media_type
-        """, (
-            msg.id,
-            msg.date.replace(tzinfo=None) if msg.date else None,
-            msg.sender_id,
-            text_content,
-            media_type
-        ))
+                media_type = EXCLUDED.media_type,
+                language = EXCLUDED.language,
+                category = EXCLUDED.category,
+                summary = EXCLUDED.summary,
+                tags = EXCLUDED.tags,
+                event_date = EXCLUDED.event_date,
+                location = EXCLUDED.location,
+                confidence = EXCLUDED.confidence
+            """,
+            (
+                msg.id,
+                msg.date.replace(tzinfo=None) if msg.date else None,
+                msg.sender_id,
+                text_content,
+                type(msg.media).__name__ if msg.media else None,
+                enriched.language if enriched else None,
+                enriched.category if enriched else None,
+                enriched.summary if enriched else None,
+                psycopg2.extras.Json(enriched.tags) if enriched else None,
+                event_date,
+                enriched.location if enriched else None,
+                enriched.confidence if enriched else None,
+            ),
+        )
+
         conn.commit()
         conn.close()
-    except Exception as e:
-        logger.error(f"DB Error: {e}")
+        logger.info(f"✅ Successfully processed and saved message {msg.id}")
 
-# Background Worker
+    except Exception as e:
+        logger.error("Error saving message %s: %s", getattr(msg, "id", "unknown"), e)
+
+# Telegram Client
 client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 
+
 async def sync_history():
-    logger.info(f"Syncing history for {TARGET_CHANNEL}...")
+    LIMIT_RECENT = 30 
+    
+    logger.info("Syncing the last %s messages for %s...", LIMIT_RECENT, TARGET_CHANNEL)
     try:
         channel = await client.get_entity(get_peer())
-        async for msg in client.iter_messages(channel, limit=None):
-            save_message(msg)
-        logger.info("History sync complete.")
+        
+        # limit=30 ensures we only fetch the most recent news
+        async for msg in client.iter_messages(channel, limit=LIMIT_RECENT):
+            await save_message(msg)
+            
+        logger.info("Initial sync of last 30 messages complete.")
     except Exception as e:
-        logger.error(f"Sync failed: {e}")
+        logger.error("Sync failed: %s", e)
+
 
 @client.on(events.NewMessage(chats=get_peer()))
 async def handler(event):
-    logger.info(f"New message received: {event.message.id}")
-    save_message(event.message)
+    logger.info("New message received: %s", event.message.id)
+    await save_message(event.message)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -135,104 +277,65 @@ async def lifespan(app: FastAPI):
     yield
     await client.disconnect()
 
+
 app = FastAPI(lifespan=lifespan)
 
 from fastapi.middleware.cors import CORSMiddleware
 
+origins = [
+    "*",
+]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=origins,
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
 
 @app.get("/messages")
-def get_messages(limit: int = 100, offset: int = 0, search: Optional[str] = None):
+def get_messages(
+    limit: int = 10,
+    offset: int = 0,
+    category: Optional[str] = None,
+):
     conn = get_db_connection()
+    # Get Total Count for the frontend progress bar/pagination
+    c_count = conn.cursor()
+    count_query = "SELECT COUNT(*) FROM messages WHERE 1=1"
+    if category: count_query += f" AND category = '{category}'"
+    c_count.execute(count_query)
+    total = c_count.fetchone()[0]
+
+    # Get Data
     c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-
-    query = "SELECT * FROM messages"
+    query = "SELECT * FROM messages WHERE 1=1"
     params = []
-
-    if search:
-        query += " WHERE text ILIKE %s"
-        params.append(f"%{search}%")
-
+    if category:
+        query += " AND category = %s"
+        params.append(category)
+    
     query += " ORDER BY date DESC LIMIT %s OFFSET %s"
     params.extend([limit, offset])
-
+    
     c.execute(query, params)
     rows = c.fetchall()
     conn.close()
 
-    data = []
-    for row in rows:
-        item = dict(row)
-        if item.get("date") is not None:
-            item["date"] = item["date"].isoformat()
-        data.append(item)
-
-    return JSONResponse(content=data, media_type="application/json; charset=utf-8")
-@app.get("/news")
-def get_news(limit: int = 10):
-    conn = get_db_connection()
-    c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-
-    c.execute("""
-        SELECT * FROM messages
-        WHERE text IS NOT NULL AND text <> ''
-        ORDER BY date DESC
-        LIMIT %s
-    """, (limit * 9,))
-
-    rows = c.fetchall()
-    conn.close()
-
-    # Группируем сообщения по "окну времени" — 30 секунд
-    # Сообщения на 3 языках отправляются почти одновременно
-    from datetime import datetime, timedelta
-
-    groups = []  # список: {"date": ..., "ru": ..., "en": ..., "kz": ...}
-
-    for row in rows:
-        text = row["text"]
-        if not text:
-            continue
-
-        lang = detect_language(text)
-        msg_date = row["date"]  # уже datetime объект из psycopg2
-
-        # Ищем существующую группу в пределах 30 секунд
-        matched_group = None
-        for group in groups:
-            if abs((group["_date"] - msg_date).total_seconds()) <= 30:
-                matched_group = group
-                break
-
-        if matched_group is None:
-            matched_group = {
-                "_date": msg_date,
-                "date": msg_date.isoformat() if msg_date else None,
-                "ru": None,
-                "en": None,
-                "kz": None
-            }
-            groups.append(matched_group)
-
-        # Только если язык ещё не заполнен
-        if matched_group[lang] is None:
-            matched_group[lang] = text
-
-    # Убираем служебное поле и берём только полные/частичные группы
-    result = []
-    for g in groups:
-        del g["_date"]
-        result.append(g)
-
-    return JSONResponse(content=result[:limit], media_type="application/json; charset=utf-8")
+    return {
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "data": rows
+    }
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run(app, host="0.0.0.0", port=8000)

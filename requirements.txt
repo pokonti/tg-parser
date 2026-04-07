@@ -3,3 +3,7 @@ uvicorn
 telethon
 python-dotenv
 psycopg2-binary
+pydantic
+google-genai
+google-api-core
+httpx
