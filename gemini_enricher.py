@@ -38,13 +38,15 @@ Classification rules:
 - announcement: informational update, notice, reminder, policy/service/schedule change
 
 Extraction rules:
-- summary: one short sentence
+- summary: one short sentence (it should be the same language as the message is)
 - tags: 3 to 6 useful short keywords
 - event_date: only if clearly present in the post, otherwise null
 - location: only if clearly present in the post, otherwise null
 - confidence: number from 0 to 1
 - do not invent facts
 - if multiple languages are used, return "mixed"
+Detect input language
+- Return category, topic, tags, location in the SAME language as input
 """.strip()
 
 

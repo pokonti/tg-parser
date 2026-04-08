@@ -159,36 +159,38 @@ def init_db():
 
 
 async def save_message(msg):
+    conn = None
     try:
         text_content = msg.message if msg.message else ""
         if not text_content.strip():
             return
 
-        # 1. Check if already exists to save Gemini quota
         conn = get_db_connection()
         c = conn.cursor()
+
+        # 1. Проверка — уже обработано?
         c.execute("SELECT category FROM messages WHERE message_id = %s", (msg.id,))
         existing = c.fetchone()
-        
+
         if existing and existing[0] is not None:
-            conn.close()
             return
 
-        try:
-            # Increase base sleep to 6 seconds to stay under 15 RPM safely
-            await asyncio.sleep(6) 
-            enriched = await enricher.enrich(text_content)
-        except exceptions.ResourceExhausted:
-            logger.error("Quota hit! Sleeping for 60 seconds before retrying...")
-            await asyncio.sleep(60) # Heavy sleep on quota hit
-            return
-        
-        # 2. Throttling for Gemini
-        await asyncio.sleep(4) 
+        enriched = None
 
-        enriched = await enricher.enrich(text_content)
-        
-        # Parse event date
+        # 2. Gemini с retry
+        for attempt in range(2):  # максимум 2 попытки
+            try:
+                await asyncio.sleep(6)  # троттлинг
+                enriched = await enricher.enrich(text_content)
+                break
+            except exceptions.ResourceExhausted as e:
+                logger.warning(f"Quota hit (attempt {attempt+1}). Sleeping 30s...")
+                await asyncio.sleep(30)
+            except Exception as e:
+                logger.error(f"Gemini error: {e}")
+                break
+
+        # 3. Парсим дату
         event_date = None
         if enriched and enriched.event_date:
             try:
@@ -198,7 +200,7 @@ async def save_message(msg):
             except Exception:
                 pass
 
-        # 3. FULL SQL QUERY (Replacing the "..." placeholders)
+        # 4. Сохраняем даже если enriched=None
         c.execute(
             """
             INSERT INTO messages (
@@ -229,7 +231,7 @@ async def save_message(msg):
                 enriched.language if enriched else None,
                 enriched.category if enriched else None,
                 enriched.summary if enriched else None,
-                psycopg2.extras.Json(enriched.tags) if enriched else None,
+                psycopg2.extras.Json(enriched.tags) if enriched and enriched.tags else None,
                 event_date,
                 enriched.location if enriched else None,
                 enriched.confidence if enriched else None,
@@ -237,11 +239,14 @@ async def save_message(msg):
         )
 
         conn.commit()
-        conn.close()
-        logger.info(f"✅ Successfully processed and saved message {msg.id}")
+        logger.info(f"✅ Saved message {msg.id}")
 
     except Exception as e:
         logger.error("Error saving message %s: %s", getattr(msg, "id", "unknown"), e)
+
+    finally:
+        if conn:
+            conn.close()
 
 # Telegram Client
 client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
@@ -334,6 +339,83 @@ def get_messages(
         "offset": offset,
         "data": rows
     }
+
+import asyncio
+from datetime import datetime
+import logging
+import psycopg2.extras
+
+logger = logging.getLogger("telegram_worker")
+
+BATCH_SIZE = 2       # количество сообщений за один раз
+BATCH_DELAY = 30     # секунд между пачками
+CHECK_INTERVAL = 600 # секунд между циклами проверки базы
+
+async def gradual_enrich_worker():
+    while True:
+        try:
+            conn = get_db_connection()
+            c = conn.cursor()
+            # Берём небольшую пачку необработанных сообщений
+            c.execute(
+                "SELECT message_id, text FROM messages WHERE category IS NULL OR language IS NULL ORDER BY date ASC LIMIT %s",
+                (BATCH_SIZE,)
+            )
+            rows = c.fetchall()
+            conn.close()
+
+            if not rows:
+                logger.info("No unenriched messages found.")
+            else:
+                for msg_id, text_content in rows:
+                    try:
+                        await asyncio.sleep(6)  # throttle между запросами
+                        enriched = await enricher.enrich(text_content)
+                    except exceptions.ResourceExhausted:
+                        logger.warning("Gemini quota hit. Stopping batch processing for now.")
+                        break  # прекращаем обработку, лимит исчерпан
+
+                    if enriched:
+                        conn = get_db_connection()
+                        c = conn.cursor()
+                        event_date = None
+                        if enriched.event_date:
+                            try:
+                                event_date = datetime.fromisoformat(
+                                    enriched.event_date.replace("Z", "+00:00")
+                                ).replace(tzinfo=None)
+                            except Exception:
+                                pass
+                        c.execute(
+                            """
+                            UPDATE messages
+                            SET language=%s, category=%s, summary=%s, tags=%s, event_date=%s, location=%s, confidence=%s
+                            WHERE message_id=%s
+                            """,
+                            (
+                                enriched.language,
+                                enriched.category,
+                                enriched.summary,
+                                psycopg2.extras.Json(enriched.tags) if enriched.tags else None,
+                                event_date,
+                                enriched.location,
+                                enriched.confidence,
+                                msg_id
+                            ),
+                        )
+                        conn.commit()
+                        conn.close()
+                        logger.info(f"✅ Enriched message {msg_id}")
+                    await asyncio.sleep(BATCH_DELAY)  # пауза между сообщениями
+        except Exception as e:
+            logger.error(f"Error in gradual worker: {e}")
+
+        await asyncio.sleep(CHECK_INTERVAL)  # ждём следующую проверку базы
+
+
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(gradual_enrich_worker())
 
 if __name__ == "__main__":
     import uvicorn
