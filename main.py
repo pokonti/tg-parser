@@ -288,7 +288,10 @@ app = FastAPI(lifespan=lifespan)
 from fastapi.middleware.cors import CORSMiddleware
 
 origins = [
-    "*",
+    "http://localhost:5173",
+    "https://frontend-diploma-8zym.vercel.app",
+    "https://kbtucare.site",
+    "https://www.kbtucare.site",
 ]
 
 app.add_middleware(
